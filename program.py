@@ -1,19 +1,29 @@
 """launch_watch: glyphh's launch numbers each morning (GitHub, PyPI, npm), kept in its SQLite database day by day,
-and emailed as a summary through Resend. From Claude it asks before emailing; a scheduled run sends on its own,
-since nobody is there to answer before the wait expires."""
+and emailed as a summary by the rrotor's signed-in claude CLI, through the owner's claude.ai Gmail connector
+(ctx.cli). From Claude it asks before emailing; a scheduled run sends on its own, since nobody is there to answer
+before the wait expires."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from rrotor import Ctx, Result
+from rrotor import CliError, Ctx, Result
 
 REPO = "glyphh-ai/glyphh"
 PYPI = "glyphh"
 NPM = "@glyphh-ai/glyphh"
 TO = "chris.timmerman@glyphh.ai"
-SENDER = "Launch watch <launch-watch@glyphh.ai>"
+GMAIL_SEND = "mcp__claude_ai_Gmail__send_message"  # the Gmail connector's send tool, as Claude Code names it
+ASK = """Send one email with your Gmail connector's send_message tool, exactly as given here, and do nothing else.
+
+To: {to}
+Subject: {subject}
+
+{body}
+
+Do not change the subject or the body. Once it is sent, reply with only: SENT <the message id>.
+If it cannot be sent, reply with only: FAILED <why>."""
 GH = {"Accept": "application/vnd.github+json", "User-Agent": "launch_watch"}
 COLS = ("day", "stars", "forks", "open_issues", "pypi_day", "pypi_week", "npm_day", "npm_week", "new_items", "emailed")
 
@@ -71,13 +81,22 @@ def _summary(day: str, n: dict[str, Any], prev: dict[str, Any] | None) -> tuple[
     return subject, "\n".join(lines)
 
 
-def _send(ctx: Ctx, sender: str, to: str, subject: str, body: str) -> str:
-    answer = ctx.http.post(
-        "https://api.resend.com/emails",
-        json={"from": sender, "to": [to], "subject": subject, "text": body},
-        headers={"Authorization": f"Bearer {ctx.secrets['RESEND_API_KEY']}"},
-    )
-    return answer.raise_for_status().json().get("id", "")
+def _send(ctx: Ctx, to: str, subject: str, body: str) -> tuple[bool, str]:
+    """The summary emailed by the claude CLI through Gmail (once per run: ctx.cli keeps what it answered). Answers
+    whether it was sent, and the message id or why not."""
+    prompt = ASK.format(to=to, subject=subject, body=body)
+    try:
+        got = ctx.cli("claude", ["-p", prompt, "--allowedTools", GMAIL_SEND, "--output-format", "json"])
+    except CliError as err:
+        return False, f"{err.code}: {err.message}"
+    try:
+        answer = json.loads(got.stdout)
+    except ValueError:
+        return False, f"claude exited {got.exit_code}: {(got.stderr or got.stdout).strip()[:500]}"
+    said = str(answer.get("result") or "").strip()
+    if got.exit_code != 0 or answer.get("is_error") or not said.startswith("SENT"):
+        return False, said[:500] or f"claude exited {got.exit_code}"
+    return True, said.removeprefix("SENT").strip()
 
 
 def morning(ctx: Ctx, inputs: dict[str, Any]) -> Result:
@@ -103,11 +122,14 @@ def morning(ctx: Ctx, inputs: dict[str, Any]) -> Result:
     if ctx.caller != "schedule" and not ctx.ask_approval("email", f"Email this to {to}?\n\n{subject}\n\n{body}"):
         ctx.log("kept, not emailed: declined", day=day)
         return Result.done({"day": day, "subject": subject, "summary": body, "emailed": False})
-    sent = ctx.checkpoint(f"email:{day}:{to}", lambda: _send(ctx, inputs.get("sender") or SENDER, to, subject, body))
+    sent, said = _send(ctx, to, subject, body)
+    if not sent:
+        ctx.log("kept, not emailed: claude could not send it", day=day, why=said)
+        return Result.done({"day": day, "subject": subject, "summary": body, "emailed": False, "error": said})
     with ctx.db:
         ctx.db.execute("update days set emailed = 1 where day = ?", (day,))
-    ctx.log("emailed", day=day, to=to, id=sent)
-    return Result.done({"day": day, "subject": subject, "summary": body, "emailed": True, "email_id": sent})
+    ctx.log("emailed", day=day, to=to, id=said)
+    return Result.done({"day": day, "subject": subject, "summary": body, "emailed": True, "email_id": said})
 
 
 def history(ctx: Ctx, inputs: dict[str, Any]) -> Result:
